@@ -4,6 +4,10 @@ namespace Mai.Pty;
 
 public static class ComparisonTable
 {
+    /// <summary>
+    /// https://learn.microsoft.com/zh-cn/windows/console/console-virtual-terminal-sequences
+    /// Source: 虚拟控制台序列
+    /// </summary>
     public static Dictionary<ConsoleKey, string> ConsoleKeyMap = new()
     {
         { ConsoleKey.LeftArrow, "[D" },
