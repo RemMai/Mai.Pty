@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Xunit.Abstractions;
 
 namespace Pty.Test;

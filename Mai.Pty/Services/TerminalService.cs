@@ -1,5 +1,4 @@
-﻿using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Text;
 using Pty.Net;
 
@@ -7,107 +6,208 @@ namespace Mai.Pty.Services;
 
 public class TerminalService
 {
-    private PtyOptions _options { get; set; }
-    private CancellationToken TimeoutToken { get; } = new CancellationTokenSource(300_000).Token;
-    private readonly TaskCompletionSource<uint> _processExitedTcs = new();
-    private UTF8Encoding _encoding = new(encoderShouldEmitUTF8Identifier: false);
-    public ConcurrentBag<string> Output { get; private set; }
+    /// <summary>
+    /// 退出事件
+    /// </summary>
+    event EventHandler<PtyExitedEventArgs>? StandardExited;
 
-    public string App = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-        ? Path.Combine(Environment.SystemDirectory, "cmd.exe")
-        : "sh";
+    /// <summary>
+    /// 异常输出
+    /// </summary>
+    public event EventHandler<Exception>? StandardError;
 
-    private IPtyConnection? Terminal { get; set; }
+    /// <summary>
+    /// 正常输出（String）
+    /// </summary>
+    public event EventHandler<string>? StandardOutput;
 
-    public TerminalService(int rows = 25, int cols = 80, string? cwd = null)
+    /// <summary>
+    /// 流输出
+    /// </summary>
+    public event EventHandler<byte[]>? StandardBytesOutput;
+
+
+    /// <summary>
+    /// 配置
+    /// </summary> 
+    public TerminalOptions? TerminalOptions
     {
-        if (cwd != null && !Directory.Exists(cwd))
+        get => new()
         {
-            throw new ArgumentNullException(nameof(cwd), "cwd must be a valid directory");
-        }
-
-        _options = new PtyOptions
-        {
-            Name = "Mai.Pty.Core",
-            Cols = cols,
-            Rows = rows,
-            Cwd = cwd ?? Environment.CurrentDirectory,
-            App = App,
+            Name = _options.Name,
+            Rows = _options.Rows,
+            Cols = _options.Cols,
+            Cwd = _options.Cwd,
+            App = _options.App,
+            CommandLine = _options.CommandLine,
+            VerbatimCommandLine = _options.VerbatimCommandLine,
+            ForceWinPty = _options.ForceWinPty,
+            Environment = _options.Environment,
         };
+        set
+        {
+            if (IsRunning)
+            {
+                throw new Exception("Terminal is running, can not change options");
+            }
 
-        Output = new ConcurrentBag<string>();
-        Builder();
+            if (value == null)
+            {
+                value = new TerminalOptions();
+            }
+
+            _options = new PtyOptions
+            {
+                Name = value.Name,
+                Rows = value.Rows,
+                Cols = value.Cols,
+                Cwd = value.Cwd,
+                App = value.App,
+                CommandLine = value.CommandLine,
+                VerbatimCommandLine = value.VerbatimCommandLine,
+                ForceWinPty = value.ForceWinPty,
+                Environment = value.Environment,
+            };
+        }
     }
 
-    public async Task Builder()
-    {
-        if (Terminal == null)
-        {
-            Terminal = await PtyProvider.SpawnAsync(_options, TimeoutToken);
-            Terminal.ProcessExited += (sender, e) => _processExitedTcs.TrySetResult((uint)Terminal.ExitCode);
+    /// <summary>
+    /// 取消令牌
+    /// </summary>
+    public CancellationTokenSource TerminalCancellationTokenSource { get; } = new();
 
-            BuilderMessageOutContainer();
+    private CancellationToken CancellationToken { get; set; }
+
+    /// <summary>
+    /// 是否在运行
+    /// </summary>
+    public bool IsRunning { get; private set; }
+
+    /// <summary>
+    /// 任务完成的标记
+    /// </summary>
+    private readonly TaskCompletionSource<uint> _processExitedTcs = new();
+
+    /// <summary>
+    /// 编码
+    /// </summary>
+    public readonly UTF8Encoding Encoding = new(encoderShouldEmitUTF8Identifier: false);
+
+
+    public int GerProcessId => Terminal?.Pid ?? -1;
+
+    /// <summary>
+    /// Pty
+    /// </summary>
+    public IPtyConnection? Terminal { get; private set; }
+
+    /// <summary>
+    /// 构造函数
+    /// </summary>
+    public TerminalService(TerminalOptions terminalOptions)
+    {
+        TerminalOptions = terminalOptions;
+    }
+
+    public TerminalService()
+    {
+        TerminalOptions = null;
+    }
+
+    private PtyOptions _options { get; set; }
+
+
+    /// <summary>
+    /// 启动Pty
+    /// </summary>
+    public async Task Start()
+    {
+        if (Terminal == null || _processExitedTcs.Task.IsCompleted)
+        {
+            try
+            {
+                CancellationToken = TerminalCancellationTokenSource.Token;
+                Terminal = await PtyProvider.SpawnAsync(_options, CancellationToken).ConfigureAwait(false);
+                Terminal.ProcessExited += (sender, e) =>
+                {
+                    _processExitedTcs.TrySetResult((uint)Terminal.ExitCode);
+                    StandardExited?.Invoke(sender, e);
+                    TerminalCancellationTokenSource.Cancel();
+                };
+                OutputMessage();
+                IsRunning = true;
+            }
+            catch (Exception e)
+            {
+                StandardError?.Invoke(this, e);
+                IsRunning = false;
+                throw;
+            }
         }
     }
 
 
-    private void BuilderMessageOutContainer()
+    private void OutputMessage()
     {
         Task.Run(async () =>
         {
-            while (!TimeoutToken.IsCancellationRequested && !_processExitedTcs.Task.IsCompleted)
+            while (!CancellationToken.IsCancellationRequested && !_processExitedTcs.Task.IsCompleted)
             {
                 try
                 {
                     var bytes = new byte[4096];
-                    var count = await Terminal!.ReaderStream.ReadAsync(bytes, TimeoutToken).ConfigureAwait(false);
-
+                    var count = await Terminal!.ReaderStream.ReadAsync(bytes, CancellationToken).ConfigureAwait(false);
                     if (count == 0)
                     {
                         break;
                     }
 
-                    var data = _encoding.GetString(bytes);
-                    Console.Write(data);
-                    Output.Add(data);
+                    StandardBytesOutput?.Invoke(this, bytes);
+                    StandardOutput?.Invoke(this, Encoding.GetString(bytes, 0, count));
                 }
                 catch (Exception e)
                 {
-                    Console.Clear();
-                    Console.WriteLine(e);
+                    StandardError?.Invoke(this, e);
+                    IsRunning = false;
                     throw;
                 }
             }
-        }, TimeoutToken).ConfigureAwait(false);
+        }, CancellationToken).ConfigureAwait(false);
     }
 
-
-    public async Task<bool> Send(string data)
+    public async Task Write(string data)
     {
-        return await Send(_encoding.GetBytes(data)).ConfigureAwait(false);
+        await Write(Encoding.GetBytes(data)).ConfigureAwait(false);
     }
 
-
-    public async Task<bool> Send(char data)
+    public async Task Write(char data)
     {
-        return await Send(new[] { Convert.ToByte(data) }).ConfigureAwait(false);
+        await Write(Convert.ToByte(data)).ConfigureAwait(false);
     }
 
-    public async Task<bool> Send(byte data)
+    public async Task Write(byte data)
     {
-        // return await Send(new[] { data }).ConfigureAwait(false);
-
+        CheckTerminal();
         Terminal!.WriterStream.WriteByte(data);
-        await Terminal.WriterStream.FlushAsync(TimeoutToken).ConfigureAwait(false);
-
-        return true;
+        await Terminal.WriterStream.FlushAsync(CancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<bool> Send(byte[] data)
+    public async Task Write(byte[] data)
     {
-        await Terminal!.WriterStream.WriteAsync(data, TimeoutToken).ConfigureAwait(false);
-        await Terminal.WriterStream.FlushAsync(TimeoutToken).ConfigureAwait(false);
+        CheckTerminal();
+        await Terminal!.WriterStream.WriteAsync(data, CancellationToken).ConfigureAwait(false);
+        await Terminal.WriterStream.FlushAsync(CancellationToken).ConfigureAwait(false);
+    }
 
-        return true;
+    private void CheckTerminal()
+    {
+        if (!IsRunning || Terminal == null)
+        {
+            var exception = new Exception("Terminal not running");
+
+            StandardError?.Invoke(this, exception);
+
+            throw exception;
+        }
     }
 }
